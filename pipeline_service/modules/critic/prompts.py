@@ -165,3 +165,124 @@ emit the JSON report following the scoring rubric and protocol above.
 Remember: include `matching_aspects` (what already works) alongside
 `issues` — the repair stage needs the preserve-list.
 """
+
+
+# ---------------------------------------------------------------------------
+# Critic-editor prompt (single call: sees reference + render + JS → outputs fixed JS)
+# ---------------------------------------------------------------------------
+
+# Inlined Three.js output spec (kept local so the scene_coder/JS-generation
+# prompts are not touched).
+_THREEJS_OUTPUT_SPEC_REFERENCE = """\
+Three.js output specification (condensed, authoritative):
+
+## Required module shape
+- Return ONLY JavaScript source code.
+- The module must export exactly one default function:
+  `export default function generate(THREE) { ... }`
+- The function must be synchronous.
+- No imports, no require, no external dependencies.
+- `THREE` is only available as the function parameter, never at top level.
+
+## Scene requirements
+- Return a Group, Mesh, LineSegments, or Points.
+- Build geometry algorithmically; do not embed large literal arrays or binary blobs.
+- Asset must fit within [-0.5, 0.5] on every axis.
+- Y-up. The object should face +Z.
+- Always normalize with a fit-to-unit-cube helper before returning.
+
+## Main limits
+- Max 250k vertices
+- Max 200 draw calls
+- Max depth 32
+- Max 50k instanced objects total
+- Max 1 MB DataTexture data
+- Max file size 1 MB
+- Max literal budget 50 KB
+- Max execution time 5 seconds
+
+## Allowed object/material pairings
+- Mesh / InstancedMesh -> MeshStandardMaterial, MeshPhysicalMaterial, MeshBasicMaterial
+- Line / LineSegments -> LineBasicMaterial or LineDashedMaterial
+- Points -> PointsMaterial
+
+## Important prohibitions
+- No randomness: no Math.random, Date, performance, crypto
+- No DOM / browser globals: no window, document, navigator
+- No dynamic code: no eval, Function, import(), require()
+- No loaders, no ShaderMaterial, no RawShaderMaterial
+- No top-level THREE usage
+
+## Practical guidance
+- Prefer simple reusable geometry/material blocks over many unique meshes.
+- Prefer primitive composition, lathe, tube, extrude, and instancing.
+- Use helper functions if useful, but pass THREE into them when needed.
+- If unsure, favor a simpler valid procedural approximation over an invalid fancy one.
+"""
+
+
+CRITIC_EDITOR_SYSTEM_PROMPT = (
+    """You are a visual code editor for procedurally generated Three.js 3D objects.
+
+You receive the ORIGINAL reference image, a 2x2 RENDER GRID of the current
+reconstruction, and the full JavaScript module that produced it.
+
+Your task: compare the render to the reference and output a corrected JavaScript
+module that closes the most impactful visual gaps.
+
+## Editing strategy
+
+Work through the comparison in this order and fix the top issues:
+1. Object class and overall silhouette — if the render shows the wrong kind of
+   object, that is the highest-priority fix.
+2. Part count, presence, and structural attachment — missing wheels, rotors,
+   wings, legs, arms, or disconnected assemblies.
+3. Proportions and scale — use `mesh.scale.set(sx, sy, sz)` before `group.add()`
+   as the fastest fix; only rebuild geometry when the primitive type must change.
+4. Position and orientation — move or rotate the mesh along the named axis.
+5. Materials and colors — change `material.color` hex or swap material type/PBR params.
+
+Find `const <part_name> = ...` in the module and edit that section in place.
+Do NOT rewrite the entire module from scratch — patch only what needs fixing.
+
+Vehicle priority: fix object class, silhouette, part count, and attachment BEFORE
+color or material. Floating parts (wheels off axles, wings off fuselage, rotors
+off arms) are structural failures.
+
+Surface decoration priority: if painted motifs float away from the vessel body,
+move them onto the surface with a tiny normal offset and flatten them.
+
+Seating priority: fix seat count, cushion modules, back height, arm shape, and
+leg/frame geometry BEFORE material polish.
+
+"""
+    + _THREEJS_OUTPUT_SPEC_REFERENCE
+    + """
+
+Critical API rules (the JS checker will reject these silently):
+- No randomness — ever: `Math.random`, `Date`, `crypto`, `performance`,
+  `THREE.MathUtils.seededRandom` and `THREE.MathUtils.generateUUID` all raise
+  `FORBIDDEN_IDENTIFIER`. Use index arithmetic for deterministic variation
+  (e.g. `i / N * 2 * Math.PI`).
+- `LatheGeometry`, `ExtrudeGeometry` and any API accepting 2D points MUST
+  receive `new THREE.Vector2(x, y)` objects — plain `[x, y]` arrays silently
+  produce NaN vertices and a blank render. Prefer `SplineCurve` /
+  `CubicBezierCurve` whose `getSpacedPoints()` returns `Vector2[]` directly.
+- `TubeGeometry` / `CatmullRomCurve3` paths MUST use `new THREE.Vector3(x, y, z)`.
+
+Return ONLY the full corrected JavaScript module source — no prose, no markdown fences.
+"""
+)
+
+
+CRITIC_EDITOR_USER_TEMPLATE = """Current JavaScript module (full source):
+```javascript
+{js_code}
+```
+
+Artifact context (OSD + part names):
+{scene_ir_json}
+
+Compare the ORIGINAL (first image) with the RENDER GRID (second image) and output
+the corrected JavaScript module. Return ONLY the JS module source.
+"""

@@ -9,7 +9,12 @@ from typing import Any
 from config.settings import ProviderRoutingConfig
 from logger_config import logger
 from modules.base_agent import BaseAgent
-from modules.critic.prompts import CRITIC_SYSTEM_PROMPT, CRITIC_USER_TEMPLATE
+from modules.critic.prompts import (
+    CRITIC_EDITOR_SYSTEM_PROMPT,
+    CRITIC_EDITOR_USER_TEMPLATE,
+    CRITIC_SYSTEM_PROMPT,
+    CRITIC_USER_TEMPLATE,
+)
 from modules.critic.schema import CriticReport
 from utils.json_extract import extract_json_object
 from utils.retry import async_retry
@@ -124,6 +129,42 @@ class CriticAgent(BaseAgent):
             max_retries=self.max_retries,
             reasoning_effort=self.reasoning_effort,
             ensemble_size=self.ensemble_size,
+            backend=self.backend,
+            providers=self.providers,
+        )
+
+    async def edit(
+        self,
+        *,
+        task_id: str,
+        image_bytes: bytes,
+        image_mime: str,
+        render_png: bytes,
+        js_code: str,
+        artifact_context: dict,
+    ) -> str:
+        """Single-call visual editor: returns corrected JS code directly."""
+        return await run_critic_edit(
+            task_id=task_id,
+            image_bytes=image_bytes,
+            image_mime=image_mime,
+            render_png=render_png,
+            js_code=js_code,
+            artifact_context=artifact_context,
+            client=self.client,
+            model=self.model,
+            # Editor rewrites the FULL module, so it needs a coder-sized budget,
+            # not the critic's report-sized max_tokens (e.g. 6144).
+            max_tokens=max(self.max_tokens, 16384),
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
+            presence_penalty=self.presence_penalty,
+            repetition_penalty=self.repetition_penalty,
+            seed=self.seed,
+            max_retries=self.max_retries,
+            reasoning_effort=self.reasoning_effort,
             backend=self.backend,
             providers=self.providers,
         )
@@ -252,3 +293,122 @@ async def run_critic(
         f"[5/7 Critic] Finished Task {task_id} | Ensemble: {ensemble_size} | Scores: {[round(r.overall_score, 2) for r in reports]} | Mean: {mean_score:.2f} | Median: {median_report.overall_score:.2f} | Issues: {len(merged.issues)}"
     )
     return merged
+
+
+_JS_INLINE_MAX_CHARS = 40_000  # ~10k tokens; enough for any realistic module
+
+
+def _normalize_js_output(raw: str) -> str:
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines:
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    return text
+
+
+def _looks_like_js_module(text: str) -> bool:
+    return "export default function generate(THREE)" in text and "return" in text
+
+
+async def run_critic_edit(
+    *,
+    task_id: str,
+    image_bytes: bytes,
+    image_mime: str,
+    render_png: bytes,
+    js_code: str,
+    artifact_context: dict,
+    client: Any,
+    model: str,
+    max_tokens: int = 16384,
+    temperature: float = 0.0,
+    top_p: float | None = None,
+    top_k: int | None = None,
+    min_p: float | None = None,
+    presence_penalty: float | None = None,
+    repetition_penalty: float | None = None,
+    seed: int | None = 42,
+    max_retries: int = 2,
+    reasoning_effort: str | None = None,
+    backend: str = "openrouter",
+    providers: ProviderRoutingConfig | None = None,
+) -> str:
+    """Single-call visual editor. Returns the corrected JS module source."""
+    logger.info(
+        f"[Critic-Edit] Started Task {task_id} | Model: {model} "
+        f"| JS: {len(js_code)} chars | Image KB: {len(image_bytes) / 1024:.1f} "
+        f"| Render KB: {len(render_png) / 1024:.1f}"
+    )
+
+    image_b64 = base64.b64encode(image_bytes).decode()
+    render_b64 = base64.b64encode(render_png).decode()
+    artifact_json = _summarize_artifact_context(artifact_context)
+
+    extra_body: dict[str, Any] = {}
+    if backend == "vllm":
+        # The editor must emit a FULL JS module within max_tokens. On vLLM
+        # thinking models, leaving thinking on burns the whole token budget on a
+        # <think> chain and returns empty content for large modules
+        # (finish_reason="length" -> "Critic editor returned empty response").
+        extra_body["chat_template_kwargs"] = {"enable_thinking": False}
+    elif reasoning_effort:
+        extra_body["reasoning"] = {"effort": reasoning_effort}
+    for _ek, _ev in (
+        ("top_k", top_k),
+        ("min_p", min_p),
+        ("repetition_penalty", repetition_penalty),
+    ):
+        if _ev is not None:
+            extra_body[_ek] = _ev
+
+    call_kwargs: dict[str, Any] = {}
+    if top_p is not None:
+        call_kwargs["top_p"] = top_p
+    if presence_penalty is not None:
+        call_kwargs["presence_penalty"] = presence_penalty
+    if providers is not None and backend != "vllm":
+        extra_body["provider"] = providers.model_dump(exclude_none=True)
+
+    messages = [
+        {"role": "system", "content": CRITIC_EDITOR_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": CRITIC_EDITOR_USER_TEMPLATE.format(
+                    js_code=js_code[:_JS_INLINE_MAX_CHARS],
+                    scene_ir_json=artifact_json,
+                )},
+                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_b64}"}},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{render_b64}"}},
+            ],
+        },
+    ]
+
+    async def _call(_attempt: int, _last_err: str | None) -> str:
+        t0 = time.time()
+        response = await client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            seed=seed,
+            max_tokens=max_tokens,
+            extra_body=extra_body or None,
+            **call_kwargs,
+        )
+        if not response.choices or not response.choices[0].message.content:
+            raise ValueError("Critic editor returned empty response")
+        raw = response.choices[0].message.content.strip()
+        fixed = _normalize_js_output(raw)
+        if not _looks_like_js_module(fixed):
+            raise ValueError("Critic editor did not return a valid JS module")
+        logger.info(
+            f"[Critic-Edit] Finished Task {task_id} | Elapsed: {time.time() - t0:.1f}s "
+            f"| Bytes: {len(fixed.encode('utf-8'))}"
+        )
+        return fixed
+
+    return await async_retry(_call, max_retries=max_retries)

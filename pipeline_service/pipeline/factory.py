@@ -30,6 +30,7 @@ def build_pipeline(
     actors = settings.actors
     policy = settings.event_bus
     use_planner = settings.pipeline.use_planner
+    use_critic_edit = settings.pipeline.use_critic_edit
     ensemble_size = actors.coder.ensemble_size
 
     if use_planner:
@@ -42,7 +43,7 @@ def build_pipeline(
     coder = SceneCoderAgent(clients[actors.coder.client], session_store=session_store, settings=actors.coder)
     critic = CriticAgent(clients[actors.critic.client], settings=actors.critic)
 
-    if ensemble_size > 1:
+    if ensemble_size > 1 or use_critic_edit:
         judge: JudgeAgent | None = JudgeAgent(
             clients[actors.judge.client], settings=actors.judge,
         )
@@ -60,6 +61,7 @@ def build_pipeline(
         http_client=http_client,
         coder_multimodal=actors.coder.multimodal,
         use_planner=use_planner,
+        use_critic_edit=use_critic_edit,
         coder_ensemble_size=ensemble_size,
         coder_ensemble_temperature=actors.coder.ensemble_temperature,
         max_iter=policy.max_iter,

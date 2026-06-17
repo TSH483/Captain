@@ -7,6 +7,7 @@ pipeline:
   batch_time_budget: 14400
   prompt_timeout: 600.0
   use_planner: false
+  use_critic_edit: true
 
 benchmark: true  
 warmup: true

@@ -391,3 +391,118 @@ async def _run_bracket(
         )
         round_idx += 1
     return current[0]
+
+
+async def critic_edit_stage(
+    task: PipelineTask,
+    *,
+    critic,
+    judge,
+    js_checker,
+    renderer,
+    sem_critic: asyncio.Semaphore,
+    sem_checker: asyncio.Semaphore,
+    sem_renderer: asyncio.Semaphore,
+    sem_judge: asyncio.Semaphore,
+    status: dict[str, str],
+) -> None:
+    """Optional post-pass: critic edits the best JS directly, judge duel
+    decides whether the edit replaces the current best.
+
+    Reads `task.best_js_code` / `task.best_rendered_png` (set during the
+    main iteration loop) and may overwrite them if the edited candidate
+    wins the duel.
+    """
+    if task.best_js_code is None or task.best_rendered_png is None:
+        logger.warning(f"[CRITIC-EDIT] {task.stem} | skip: no best snapshot")
+        return
+    if task.image_bytes is None:
+        logger.warning(f"[CRITIC-EDIT] {task.stem} | skip: no reference image")
+        return
+
+    osd = OSD.model_validate_json(task.osd) if task.osd is not None else None
+    artifact_context = {
+        "kind": "coder_v1",
+        "js_code": task.best_js_code,
+        "osd": osd.model_dump() if osd is not None else None,
+    }
+
+    async with stage_guard(task, "critic_edit", sem_critic, status):
+        try:
+            fixed_js = await critic.edit(
+                task_id=task.stem,
+                image_bytes=task.image_bytes,
+                image_mime=task.image_mime,
+                render_png=task.best_rendered_png,
+                js_code=task.best_js_code,
+                artifact_context=artifact_context,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[CRITIC-EDIT] {task.stem} | edit failed: "
+                f"{type(exc).__name__}: {exc} — keeping coder output"
+            )
+            return
+
+    shadow = PipelineTask(stem=f"{task.stem}#edit", image_url=task.image_url)
+    shadow.js_code = fixed_js
+    shadow.image_bytes = task.image_bytes
+    shadow.image_mime = task.image_mime
+
+    async with sem_checker:
+        try:
+            await js_checker.process(shadow)
+        except Exception as exc:
+            logger.warning(
+                f"[CRITIC-EDIT] {task.stem} | edit checker exception: "
+                f"{type(exc).__name__}: {exc} — keeping coder output"
+            )
+            return
+    if not shadow.js_valid:
+        logger.warning(
+            f"[CRITIC-EDIT] {task.stem} | edit failed checker: "
+            f"{shadow.js_errors[:3]} — keeping coder output"
+        )
+        return
+
+    async with sem_renderer:
+        try:
+            await renderer.process(shadow)
+        except Exception as exc:
+            logger.warning(
+                f"[CRITIC-EDIT] {task.stem} | edit render exception: "
+                f"{type(exc).__name__}: {exc} — keeping coder output"
+            )
+            return
+    if not shadow.rendered_png:
+        logger.warning(
+            f"[CRITIC-EDIT] {task.stem} | edit render produced no PNG "
+            f"— keeping coder output"
+        )
+        return
+
+    duel_winner = "B"  # default: trust the edit
+    if judge is not None:
+        try:
+            async with sem_judge:
+                verdict = await judge.compare(
+                    task_id=task.stem,
+                    match_label="critic_edit_duel",
+                    reference_bytes=task.image_bytes,
+                    reference_mime=task.image_mime,
+                    render_a=task.best_rendered_png,
+                    render_b=shadow.rendered_png,
+                )
+            duel_winner = verdict.winner
+        except Exception as exc:
+            logger.warning(
+                f"[CRITIC-EDIT] {task.stem} | duel exception: "
+                f"{type(exc).__name__}: {exc} — defaulting to edit"
+            )
+
+    if duel_winner == "B":
+        logger.info(f"[CRITIC-EDIT] {task.stem} | duel: edit wins")
+        task.best_js_code = fixed_js
+        task.best_rendered_png = shadow.rendered_png
+    else:
+        logger.info(f"[CRITIC-EDIT] {task.stem} | duel: coder output wins")

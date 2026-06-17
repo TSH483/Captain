@@ -35,6 +35,12 @@ def log_step(msg: str) -> None:
 
 
 def parse_prompts(path: str) -> list[dict]:
+    """Parse a prompts file. Two line formats are accepted:
+
+    1. ``<stem>\\t<image_url>``  (tab/space separated — legacy format)
+    2. ``<image_url>``           (bare URL — stem is derived from the URL
+                                  filename, e.g. ``.../<hash>.png`` -> ``<hash>``)
+    """
     prompts = []
     p = Path(path)
     if not p.exists():
@@ -45,10 +51,15 @@ def parse_prompts(path: str) -> list[dict]:
         if not line or line.startswith("#"):
             continue
         parts = line.split(None, 1)
-        if len(parts) < 2:
-            print(f"{YELLOW}Skipping malformed line: {line}{RESET}")
-            continue
-        prompts.append({"stem": parts[0], "image_url": parts[1]})
+        if len(parts) >= 2:
+            stem, image_url = parts[0], parts[1]
+        else:
+            image_url = parts[0]
+            stem = Path(urlparse(image_url).path).stem
+            if not stem:
+                print(f"{YELLOW}Skipping malformed line: {line}{RESET}")
+                continue
+        prompts.append({"stem": stem, "image_url": image_url})
     return prompts
 
 

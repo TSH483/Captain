@@ -26,6 +26,7 @@ class PipelineConfig(BaseModel):
     batch_time_budget: float = 1800.0
     prompt_timeout: float = 120.0
     use_planner: bool = True
+    use_critic_edit: bool = False
 
 
 class VllmServeConfig(BaseModel):
@@ -179,7 +180,7 @@ class SettingsConf(BaseSettings):
             _LLM_ACTORS_WITH_PLANNER if self.pipeline.use_planner
             else _LLM_ACTORS_BASE
         )
-        if self.actors.coder.ensemble_size > 1:
+        if self.actors.coder.ensemble_size > 1 or self.pipeline.use_critic_edit:
             actor_names.append("judge")
         for name in actor_names:
             actor: ActorConfig = getattr(self.actors, name)

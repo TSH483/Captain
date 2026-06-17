@@ -9,6 +9,7 @@ from llm.session_store import SessionStore
 from logger_config import logger
 from pipeline.stages import (
     code_and_check,
+    critic_edit_stage,
     critic_stage,
     multigen_first_iter,
     prepare_inputs_stage,
@@ -40,6 +41,7 @@ class Pipeline:
         task_deadline_s: float = 60.0,
         coder_multimodal: bool = False,
         use_planner: bool = True,
+        use_critic_edit: bool = False,
         coder_ensemble_size: int = 1,
         coder_ensemble_temperature: float = 0.3,
         planner_limit: int = 2,
@@ -59,6 +61,7 @@ class Pipeline:
         self.http_client = http_client
         self.coder_multimodal = coder_multimodal
         self.use_planner = use_planner
+        self.use_critic_edit = use_critic_edit
         self.coder_ensemble_size = coder_ensemble_size
         self.coder_ensemble_temperature = coder_ensemble_temperature
 
@@ -164,6 +167,20 @@ class Pipeline:
 
             if self._should_stop(report, iteration, task.best_score):
                 break
+
+        if self.use_critic_edit and task.best_js_code is not None:
+            await critic_edit_stage(
+                task,
+                critic=self.critic,
+                judge=self.judge,
+                js_checker=self.js_checker,
+                renderer=self.renderer,
+                sem_critic=self._sem["critic"],
+                sem_checker=self._sem["js_checker"],
+                sem_renderer=self._sem["renderer"],
+                sem_judge=self._sem["judge"],
+                status=self.task_status,
+            )
 
         if task.best_js_code is not None:
             task.js_code = task.best_js_code
